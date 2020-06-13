@@ -252,7 +252,7 @@ func (e *OutEndpoint) writeData(data ...[]byte) *tcpip.Error {
 		}
 		all = append(all, d...)
 	}
-	fmt.Printf("OutEndpoint write %v\n", all)
+	// fmt.Printf("OutEndpoint write %v\n", all)
 	_, err := e.Out.Write(all)
 	return e.TranslateErrno(err)
 }
@@ -275,7 +275,7 @@ func (e *OutEndpoint) TranslateErrno(err error) *tcpip.Error {
 
 //DeliverNetworkPacket will dispatches buf it.
 func (e *OutEndpoint) DeliverNetworkPacket(buf []byte) bool {
-	fmt.Printf("DeliverNetworkPacket data %v\n", buf)
+	// fmt.Printf("DeliverNetworkPacket data %v\n", buf)
 	n := len(buf)
 	if e.Capabilities()&stack.CapabilityHardwareGSO != 0 {
 		// Skip virtioNetHdr which is added before each packet, it

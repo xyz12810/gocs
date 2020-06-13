@@ -8,12 +8,14 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coversocks/gocs"
 	"github.com/coversocks/gocs/core"
 	"github.com/coversocks/gocs/dns"
 	"github.com/google/netstack/tcpip"
+	"github.com/google/netstack/tcpip/adapters/gonet"
 	"github.com/google/netstack/tcpip/buffer"
 	"github.com/google/netstack/tcpip/header"
 	"github.com/google/netstack/tcpip/network/arp"
@@ -27,6 +29,7 @@ import (
 
 func init() {
 	rand.Seed(time.Now().UnixNano())
+	// go showudp()
 }
 
 //StringError is Error for interface info
@@ -76,6 +79,7 @@ type readFrom interface {
 
 //UDPConn is net.Conn impl for udp connection
 type UDPConn struct {
+	Key    string
 	Retain bool //whether retain writed data
 	Local  *tcpip.FullAddress
 	Remote *tcpip.FullAddress
@@ -88,18 +92,21 @@ type UDPConn struct {
 }
 
 //NewUDPConn will create new UDPConn
-func NewUDPConn(local, remote *tcpip.FullAddress, end tcpip.Endpoint, retain bool) (conn *UDPConn) {
+func NewUDPConn(key string, local, remote *tcpip.FullAddress, end tcpip.Endpoint, retain bool) (conn *UDPConn) {
 	conn = &UDPConn{
+		Key:    key,
 		Local:  local,
 		Remote: remote,
 		End:    end,
 		Retain: retain,
 		lck:    sync.RWMutex{},
-		recv:   make(chan []byte, 100),
+		recv:   make(chan []byte, 10240),
 		latest: time.Now(),
 	}
 	return
 }
+
+var udpTotal uint64
 
 func (u *UDPConn) Read(p []byte) (n int, err error) {
 	u.latest = time.Now()
@@ -118,6 +125,8 @@ func (u *UDPConn) Read(p []byte) (n int, err error) {
 		panic("buffer too small")
 	}
 	n = copy(p, data)
+	// fmt.Printf("read %v data from %v:%v\n", n, u, p[:n])
+	atomic.AddUint64(&udpTotal, uint64(n))
 	return
 }
 
@@ -139,6 +148,7 @@ func (u *UDPConn) Write(p []byte) (n int, err error) {
 		err = NewStringError(e)
 	}
 	n = int(w)
+	// fmt.Printf("write %v data to %v:%v\n", n, u, buf[:w])
 	return
 }
 
@@ -155,8 +165,9 @@ func (u *UDPConn) closeByError(e error) (err error) {
 		return
 	}
 	u.err = e
-	u.lck.Unlock()
 	close(u.recv)
+	u.lck.Unlock()
+	u.closed(u)
 	core.DebugLog("UDPConn connection %v is closed by %v", u, e)
 	return
 }
@@ -192,39 +203,55 @@ func (u *UDPConn) String() string {
 
 //TCPConn is io.ReadWriteClose impl for netstack connection
 type TCPConn struct {
-	Retain bool //whether retain writed data
-	Waiter *waiter.Queue
-	End    tcpip.Endpoint
-	Local  *tcpip.FullAddress
-	Remote *tcpip.FullAddress
-	entry  *waiter.Entry
-	notify chan struct{}
+	Retain      bool //whether retain writed data
+	Waiter      *waiter.Queue
+	End         tcpip.Endpoint
+	Local       *tcpip.FullAddress
+	Remote      *tcpip.FullAddress
+	readEntry   *waiter.Entry
+	readNotify  chan struct{}
+	writeEntry  *waiter.Entry
+	writeNotify chan struct{}
+	err         error
+	lck         sync.RWMutex
 }
 
 //NewTCPConn will create new TCPConn
 func NewTCPConn(wq *waiter.Queue, end tcpip.Endpoint, retain bool) (conn *TCPConn) {
-	waitEntry, notifyCh := waiter.NewChannelEntry(nil)
-	wq.EventRegister(&waitEntry, waiter.EventIn)
+	readEntry, readNotify := waiter.NewChannelEntry(nil)
+	wq.EventRegister(&readEntry, waiter.EventIn)
+	writeEntry, writeNotify := waiter.NewChannelEntry(nil)
+	wq.EventRegister(&writeEntry, waiter.EventOut)
 	local, _ := end.GetLocalAddress()
 	remote, _ := end.GetRemoteAddress()
 	conn = &TCPConn{
-		Waiter: wq,
-		End:    end,
-		Retain: retain,
-		Local:  &local,
-		Remote: &remote,
-		entry:  &waitEntry,
-		notify: notifyCh,
+		Waiter:      wq,
+		End:         end,
+		Retain:      retain,
+		Local:       &local,
+		Remote:      &remote,
+		readEntry:   &readEntry,
+		readNotify:  readNotify,
+		writeEntry:  &writeEntry,
+		writeNotify: writeNotify,
+		lck:         sync.RWMutex{},
 	}
 	return
 }
 
 func (t *TCPConn) Read(p []byte) (n int, err error) {
-	for {
+	t.lck.RLock()
+	if t.err != nil {
+		err = t.err
+		t.lck.RUnlock()
+		return
+	}
+	t.lck.RUnlock()
+	for t.err == nil {
 		data, _, rerr := t.End.Read(nil)
 		if rerr != nil {
 			if rerr == tcpip.ErrWouldBlock {
-				<-t.notify
+				<-t.readNotify
 				continue
 			}
 			err = NewStringError(rerr)
@@ -240,23 +267,59 @@ func (t *TCPConn) Read(p []byte) (n int, err error) {
 }
 
 func (t *TCPConn) Write(p []byte) (n int, err error) {
+	t.lck.RLock()
+	if t.err != nil {
+		err = t.err
+		t.lck.RUnlock()
+		return
+	}
+	t.lck.RUnlock()
 	buf := p
 	if t.Retain {
 		buf = make([]byte, len(p))
 		copy(buf, p)
 	}
-	w, _, e := t.End.Write(tcpip.SlicePayload(buffer.View(buf)), tcpip.WriteOptions{})
-	if e != nil {
-		err = NewStringError(e)
+	n = 0
+	for {
+		if n == len(p) {
+			break
+		}
+		sended, _, rerr := t.End.Write(tcpip.SlicePayload(buffer.View(buf[n:])), tcpip.WriteOptions{Atomic: true})
+		if rerr != nil {
+			if rerr == tcpip.ErrWouldBlock {
+				<-t.writeNotify
+				continue
+			}
+			err = NewStringError(rerr)
+			break
+		}
+		n += int(sended)
+		// fmt.Printf("sending %v/%v %v\n", n, len(p), buf)
 	}
-	n = int(w)
+	// _, _, e := t.End.Write(tcpip.SlicePayload(buffer.View(buf)), tcpip.WriteOptions{Atomic: true})
+	// if e != nil {
+	// 	err = NewStringError(e)
+	// }
+	// n = len(p)
 	return
 }
 
 //Close will close one tcp connection
 func (t *TCPConn) Close() (err error) {
-	t.Waiter.EventUnregister(t.entry)
+	t.lck.Lock()
+	if t.err != nil {
+		t.lck.Unlock()
+		return
+	}
+	t.err = fmt.Errorf("closed")
+	t.lck.Unlock()
+	t.Waiter.EventUnregister(t.readEntry)
+	t.Waiter.EventUnregister(t.writeEntry)
+	close(t.readNotify)
+	close(t.writeNotify)
 	t.End.Close()
+	t.End.Disconnect()
+	core.DebugLog("TCPConn %v is closed", t)
 	return
 }
 
@@ -308,15 +371,15 @@ type Listener struct {
 
 //NewListener will create new Listener
 func NewListener(net string, wq *waiter.Queue, end tcpip.Endpoint, retain bool, next core.Processor) (l *Listener) {
-	waitEntry, notifyCh := waiter.NewChannelEntry(nil)
-	wq.EventRegister(&waitEntry, waiter.EventIn)
+	entry, notify := waiter.NewChannelEntry(nil)
+	wq.EventRegister(&entry, waiter.EventIn)
 	l = &Listener{
 		net:     net,
 		Waiter:  wq,
 		End:     end,
 		Retain:  retain,
-		entry:   &waitEntry,
-		notify:  notifyCh,
+		entry:   &entry,
+		notify:  notify,
 		udps:    map[string]*UDPConn{},
 		lck:     sync.RWMutex{},
 		Next:    next,
@@ -325,10 +388,9 @@ func NewListener(net string, wq *waiter.Queue, end tcpip.Endpoint, retain bool, 
 	return
 }
 
-func (l *Listener) remoteUDPSession(u *UDPConn) {
-	key := fmt.Sprintf("%v:%v-%v:%v", u.Local.Addr, u.Local.Port, u.Remote.Addr, u.Remote.Port)
+func (l *Listener) removeUDPSession(u *UDPConn) {
 	l.lck.Lock()
-	delete(l.udps, key)
+	delete(l.udps, u.Key)
 	l.lck.Unlock()
 }
 
@@ -373,17 +435,31 @@ func (l *Listener) udpAccept() (conn net.Conn, err error) {
 			err = NewStringError(rerr)
 			break
 		}
-		key := fmt.Sprintf("%v:%v-%v:%v", addr.Addr, addr.Port, to.Addr, to.Port)
-		l.lck.Lock()
-		session, ok := l.udps[key]
-		if !ok {
-			session = NewUDPConn(&to, &addr, l.End, l.Retain)
-			session.closed = l.remoteUDPSession
-			l.udps[key] = session
-			conn = session
+		if to.Port == 137 { //discard
+			continue
 		}
-		l.lck.Unlock()
-		session.recv <- data
+		key := fmt.Sprintf("%v:%v-%v:%v", addr.Addr, addr.Port, to.Addr, to.Port)
+		for {
+			l.lck.Lock()
+			session, ok := l.udps[key]
+			if !ok {
+				session = NewUDPConn(key, &to, &addr, l.End, l.Retain)
+				session.closed = l.removeUDPSession
+				l.udps[key] = session
+				conn = session
+			}
+			l.lck.Unlock()
+			session.lck.RLock()
+			if session.err == nil {
+				session.recv <- data
+				session.lck.RUnlock()
+				break
+			} else {
+				session.lck.RUnlock()
+				l.removeUDPSession(session)
+				continue
+			}
+		}
 		if conn != nil { //found one new session
 			core.DebugLog("Listener accept on %v connection %v", l.net, conn)
 			break
@@ -391,6 +467,8 @@ func (l *Listener) udpAccept() (conn net.Conn, err error) {
 	}
 	return
 }
+
+var ShowAddress = ""
 
 func (l *Listener) tcpAccept() (conn net.Conn, err error) {
 	for {
@@ -401,10 +479,18 @@ func (l *Listener) tcpAccept() (conn net.Conn, err error) {
 				continue
 			}
 			err = NewStringError(nerr)
-		} else {
-			conn = NewTCPConn(wq, end, l.Retain)
-			core.DebugLog("Listener accept on %v connection %v", l.net, conn)
+			break
 		}
+		local, _ := end.GetLocalAddress()
+		if len(ShowAddress) > 0 && !strings.Contains(ShowAddress, strings.Split(local.Addr.To4().String(), ":")[0]) {
+			fmt.Printf("test closeing %v\n", local)
+			end.Close()
+			continue
+		}
+		conn = NewTCPConn(wq, end, l.Retain)
+		conn = core.NewHashConn(conn, true, "tcp")
+		fmt.Printf("Listener accept on %v connection %v to %p\n", l.net, conn, conn)
+		core.DebugLog("Listener accept on %v connection %v", l.net, conn)
 		break
 	}
 	return
@@ -414,13 +500,21 @@ func (l *Listener) TimeoutConnection() (err error) {
 	if l.net != "udp" {
 		return
 	}
+	closing := []*UDPConn{}
 	l.lck.RLock()
-	defer l.lck.RUnlock()
+	all := len(l.udps)
 	now := time.Now()
 	for _, udp := range l.udps {
 		if now.Sub(udp.latest) > l.Timeout {
-			udp.closeByError(fmt.Errorf("time out"))
+			closing = append(closing, udp)
 		}
+	}
+	l.lck.RUnlock()
+	if len(closing) > 0 {
+		core.InfoLog("Listener will close %v/%v timeout udp connection", len(closing), all)
+	}
+	for _, udp := range closing {
+		udp.closeByError(fmt.Errorf("time out"))
 	}
 	return
 }
@@ -444,16 +538,16 @@ func (l *Listener) LoopProc() (err error) {
 	core.InfoLog("Listener start loop proc net:%v,address:%v,retain:%v,next:%v", l.net, l.Addr(), l.Retain, l.Next)
 	l.running = true
 	wg := sync.WaitGroup{}
-	if l.net == "udp" {
-		wg.Add(1)
-		go func() {
-			for l.running {
-				l.TimeoutConnection()
-				time.Sleep(3 * time.Second)
-			}
-			wg.Done()
-		}()
-	}
+	// if l.net == "udp" {
+	// 	wg.Add(1)
+	// 	go func() {
+	// 		for l.running {
+	// 			l.TimeoutConnection()
+	// 			time.Sleep(3 * time.Second)
+	// 		}
+	// 		wg.Done()
+	// 	}()
+	// }
 	var conn net.Conn
 	for {
 		conn, err = l.Accept()
@@ -477,11 +571,11 @@ type NetProcessor struct {
 }
 
 //NewNetProcessor will create new NetProcessor
-func NewNetProcessor(proxy, direct core.Processor) (net *NetProcessor) {
+func NewNetProcessor(bufferSize int, proxy, direct core.Processor) (net *NetProcessor) {
 	gfw := dns.NewGFW()
 	pac := core.NewPACProcessor(proxy, direct)
 	record := dns.NewRecordProcessor(pac)
-	dns := dns.NewProcessor(record, gfw.Find)
+	dns := dns.NewProcessor(bufferSize, record, gfw.Find)
 	port := core.NewPortDistProcessor()
 	port.Add("53", dns)
 	port.Add("*", pac)
@@ -574,6 +668,7 @@ func (s *Stack) CreateListener(net string) (l *Listener, err error) {
 		err = fmt.Errorf("not supported net %v", net)
 		return
 	}
+	// gonet.NewListener(s,)
 	end, nerr := s.NewEndpoint(protoco, s.Protoco, s.Waiter)
 	if nerr != nil {
 		err = NewStringError(nerr)
@@ -590,24 +685,27 @@ type NetProxy struct {
 	MTU        uint32
 	Netif      io.WriteCloser
 	Dialer     core.RawDialer
+	BufferSize int
 	Stack      *Stack
 	Link       *OutEndpoint
 	Client     *gocs.Client
 	ClientConf *gocs.ClientConf
-	Processor  *NetProcessor
-	TCP        *Listener
-	UDP        *Listener
-	wg         sync.WaitGroup
+	// Processor  *NetProcessor
+	TCP *Listener
+	UDP *Listener
+	ll  *gonet.Listener
+	wg  sync.WaitGroup
 }
 
 //NewNetProxy will return new NetProxy by configure file path, device mtu, net interface writer
 func NewNetProxy(conf string, mtu uint32, netif io.WriteCloser, dialer core.RawDialer) (proxy *NetProxy) {
 	proxy = &NetProxy{
-		Conf:   conf,
-		MTU:    mtu,
-		Netif:  netif,
-		Dialer: dialer,
-		wg:     sync.WaitGroup{},
+		Conf:       conf,
+		MTU:        mtu,
+		Netif:      netif,
+		Dialer:     dialer,
+		BufferSize: 2 * int(mtu),
+		wg:         sync.WaitGroup{},
 	}
 	return
 }
@@ -623,7 +721,7 @@ func (n *NetProxy) Bootstrap() (err error) {
 		core.ErrorLog("Client read configure fail with %v", err)
 		return
 	}
-	core.SetLogLevel(conf.LogLevel)
+	core.SetLogLevel(core.LogLevelDebug)
 	core.InfoLog("Client using config from %v", n.Conf)
 	workdir, _ := filepath.Abs(filepath.Dir(n.Conf))
 	if len(conf.WorkDir) > 0 && filepath.IsAbs(conf.WorkDir) {
@@ -632,11 +730,11 @@ func (n *NetProxy) Bootstrap() (err error) {
 		workdir, _ = filepath.Abs(filepath.Join(workdir, conf.WorkDir))
 	}
 	client := &gocs.Client{Conf: conf, WorkDir: workdir}
-	rules, err := client.ReadGfwRules()
-	if err != nil {
-		core.ErrorLog("Client read gfw rules fail with %v", err)
-		return
-	}
+	// rules, err := client.ReadGfwRules()
+	// if err != nil {
+	// 	core.ErrorLog("Client read gfw rules fail with %v", err)
+	// 	return
+	// }
 	wsDialer := core.NewWebsocketDialer()
 	wsDialer.Dialer = n.Dialer
 	err = client.Boostrap(wsDialer)
@@ -648,12 +746,13 @@ func (n *NetProxy) Bootstrap() (err error) {
 	//dns/pac processor init
 	rawDialer := core.NewRawDialerWrapper(n.Dialer)
 	direct := core.NewAyncProcessor(core.NewProcConnDialer(rawDialer))
-	proxy := core.NewAyncProcessor(client)
-	processor := NewNetProcessor(proxy, direct)
-	processor.GFW.Add(strings.Join(rules, "\n"), "dns://proxy")
+	// proxy := core.NewAyncProcessor(client)
+	// processor := NewNetProcessor(n.BufferSize, proxy, direct)
+
+	// processor.GFW.Add(strings.Join(rules, "\n"), "dns://proxy")
 	//
 	//netstack init
-	s := NewStack(true, processor)
+	s := NewStack(true, direct)
 	linkEP, err := NewOutEndpoint(&OutOptions{
 		MTU:            n.MTU,
 		EthernetHeader: false,
@@ -671,19 +770,27 @@ func (n *NetProxy) Bootstrap() (err error) {
 		client.Close()
 		return
 	}
-	//
-	ltcp, err := s.CreateListener("tcp")
-	if err == nil {
-		err = ltcp.Bind(&tcpip.FullAddress{})
-		if err == nil {
-			err = ltcp.Listen(10)
+	// //
+	// ltcp, err := s.CreateListener("tcp")
+	// if err == nil {
+	// 	err = ltcp.Bind(&tcpip.FullAddress{})
+	// 	if err == nil {
+	// 		err = ltcp.Listen(10)
+	// 	}
+	// }
+	// if err != nil {
+	// 	core.ErrorLog("Client create tcp listener fail with %v", err)
+	// 	client.Close()
+	// 	s.Close()
+	// 	return
+	// }
+	{
+		n.ll, err = gonet.NewListener(s.Stack, tcpip.FullAddress{}, s.Protoco)
+		if err != nil {
+			core.ErrorLog("Client create tcp listener fail with %v", err)
+			return
 		}
-	}
-	if err != nil {
-		core.ErrorLog("Client create tcp listener fail with %v", err)
-		client.Close()
-		s.Close()
-		return
+
 	}
 	ludp, err := s.CreateListener("udp")
 	if err == nil {
@@ -696,9 +803,9 @@ func (n *NetProxy) Bootstrap() (err error) {
 		return
 	}
 	n.ClientConf, n.Client = &conf, client
-	n.Processor = processor
+	// n.Processor = direct
 	n.Stack, n.Link = s, linkEP
-	n.TCP, n.UDP = ltcp, ludp
+	n.UDP = ludp
 	return
 }
 
@@ -712,7 +819,21 @@ func (n *NetProxy) Proc() {
 	core.InfoLog("NetProxy process is starting")
 	n.wg.Add(2)
 	go func() {
-		err := n.TCP.LoopProc()
+		// err := n.TCP.LoopProc()
+		var err error
+		for {
+			var conn net.Conn
+			conn, err = n.ll.Accept()
+			if err != nil {
+				fmt.Printf("error->%v\n", err)
+				break
+			}
+			conn = core.NewPrintConn(conn)
+			perr := n.Stack.Next.ProcConn(conn, "tcp://"+conn.LocalAddr().String())
+			if perr != nil {
+				core.DebugLog("ListenerProcessor proc connection(%v) fail with %v", conn, perr)
+			}
+		}
 		core.InfoLog("NetProxy tcp loop proc is stopped by %v", err)
 		n.wg.Done()
 	}()

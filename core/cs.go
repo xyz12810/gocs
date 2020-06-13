@@ -104,11 +104,32 @@ func (b *BaseConn) ReadCmd() (cmd []byte, err error) {
 	return
 }
 
+func (b *BaseConn) Read(p []byte) (n int, err error) {
+	data, err := b.ReadCmd()
+	if err == nil {
+		n = copy(p, data)
+	}
+	return
+}
+
 //WriteCmd will write data by command mode
 func (b *BaseConn) WriteCmd(cmd []byte) (w int, err error) {
 	binary.BigEndian.PutUint32(cmd, uint32(len(cmd)))
 	cmd[0] = byte(rand.Intn(255))
 	w, err = b.raw.Write(cmd)
+	// if err == nil {
+	// 	fmt.Printf("Cmd Write %v %v\n", len(cmd), cmd)
+	// }
+	return
+}
+
+func (b *BaseConn) Write(p []byte) (n int, err error) {
+	// fmt.Printf("Conn Begin %v %v\n", len(p), p)
+	buf := make([]byte, len(p)+4)
+	copy(buf[4:], p)
+	n = len(buf)
+	// fmt.Printf("Conn Write %v,%v %v\n", len(buf), len(p), buf)
+	_, err = b.WriteCmd(buf)
 	return
 }
 

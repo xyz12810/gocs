@@ -277,3 +277,11 @@ func Now() int64 {
 type Statable interface {
 	State() interface{}
 }
+
+//ReaderF is wrapper for io.Reader
+type ReaderF func(p []byte) (n int, err error)
+
+func (r ReaderF) Read(p []byte) (n int, err error) {
+	n, err = r(p)
+	return
+}

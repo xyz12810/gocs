@@ -56,8 +56,10 @@ func NewProcConnDialer(dialer Dialer) (proc *ProcConnDialer) {
 	return
 }
 
-func copyClose(dst, src io.ReadWriteCloser) {
-	io.Copy(dst, src)
+func copyClose(dst, src io.ReadWriteCloser, bufferSize int) {
+	buf := make([]byte, bufferSize)
+	_, err := io.CopyBuffer(dst, src, buf)
+	DebugLog("ProcConnDialer connection %v is closed by %v", src, err)
 	dst.Close()
 }
 
@@ -65,8 +67,8 @@ func copyClose(dst, src io.ReadWriteCloser) {
 func (p *ProcConnDialer) ProcConn(raw io.ReadWriteCloser, target string) (err error) {
 	conn, err := p.Dial(target)
 	if err == nil {
-		go copyClose(raw, conn)
-		copyClose(conn, raw)
+		go copyClose(raw, conn, 512*1024)
+		copyClose(conn, raw, 32*1024)
 	}
 	return
 }
@@ -221,4 +223,21 @@ func (e *EchoProcessor) ProcConn(r io.ReadWriteCloser, target string) (err error
 
 func (e *EchoProcessor) String() string {
 	return "EchoProcessor"
+}
+
+//PrintProcessor is Processor impl for echo connection
+type PrintProcessor struct {
+	Next Processor
+}
+
+//NewPrintProcessor will return new EchoProceessor
+func NewPrintProcessor(next Processor) (print *PrintProcessor) {
+	return &PrintProcessor{Next: next}
+}
+
+//ProcConn will process connection
+func (p *PrintProcessor) ProcConn(r io.ReadWriteCloser, target string) (err error) {
+	conn := NewPrintConn(r)
+	err = p.Next.ProcConn(conn, target)
+	return
 }

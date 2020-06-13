@@ -1,0 +1,19 @@
+{
+    "servers": [
+        {
+            "enable": true,
+            "name": "ZdyProxy",
+            "address": [
+                "wss://47.56.85.233:5203/ds?skip_verify=1"
+            ],
+            "username": "cny",
+            "password": "scorpion"
+        }
+    ],
+    "socks_addr": "0.0.0.0:1105",
+    "http_addr": "0.0.0.0:1103",
+    "manager_addr": "127.0.0.1:1101",
+    "mode": "global",
+    "log": 0,
+    "work_dir":"../../"
+}

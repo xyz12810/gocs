@@ -23,7 +23,7 @@ func main() {
 		panic(err)
 	}
 	wg := &sync.WaitGroup{}
-	go showSended(wg)
+	// go showSended(wg)
 	if os.Args[1] == "n" {
 		wg.Add(int(cc) + 1)
 		for i := int64(0); i < cc; i++ {
