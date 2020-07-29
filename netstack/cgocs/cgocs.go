@@ -1,36 +1,46 @@
-package coversocks
+package main
+
+import "C"
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
 	"runtime"
 	"sync"
 	"time"
 
+	"github.com/coversocks/gocs/core"
+	"github.com/coversocks/gocs/netstack"
 	"github.com/coversocks/gocs/netstack/dns"
 	"github.com/coversocks/gocs/netstack/pcap"
 	"github.com/coversocks/gocs/netstack/tcpip"
 
-	"net/http"
 	_ "net/http/pprof"
-
-	"github.com/coversocks/gocs/core"
-	"github.com/coversocks/gocs/netstack"
 )
 
-var xx = false
-
 func init() {
-	// log.SetFlags(log.LstdFlags | log.Lshortfile)
+	log.SetFlags(log.Lshortfile)
+	log.SetOutput(newBinderLogger())
 	runtime.GOMAXPROCS(1)
-	// go func() {
-	// 	http.HandleFunc("/debug/state", stateH)
-	// 	log.Println(http.ListenAndServe(":6060", nil))
-	// }()
+	go func() {
+		http.HandleFunc("/debug/state/", stateH)
+		http.HandleFunc("/debug/test/", testWebH)
+		log.Println(http.ListenAndServe(":6060", nil))
+	}()
 }
 
-//Hello will start inner debug and do nothing
-func Hello() {
+func main() {
+}
+
+//export cs_hello
+func cs_hello() {
+
 }
 
 //stateH is current proxy state
@@ -53,14 +63,21 @@ func stateH(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
+//testWebH is current proxy state
+func testWebH(w http.ResponseWriter, r *http.Request) {
+	url := r.URL.Query().Get("url")
+	testWeb(url, "", w)
+	fmt.Fprintf(w, "all done\n")
+}
+
 var netRWC io.ReadWriteCloser
 var netProxy *netstack.NetProxy
 var netDialer core.RawDialer
 var netRunning bool
 var netLocker = sync.RWMutex{}
 
-//Bootstrap will bootstrap by config file path and mtu and net stream
-func Bootstrap(conf string, mtu int, dump string, rwc io.ReadWriteCloser, dialer core.RawDialer) (res string) {
+//bootstrap will bootstrap by config file path and mtu and net stream
+func bootstrap(conf string, mtu int, dump string, rwc io.ReadWriteCloser, dialer core.RawDialer) (res string) {
 	targetRWC := rwc
 	if len(dump) > 0 {
 		var err error
@@ -73,6 +90,7 @@ func Bootstrap(conf string, mtu int, dump string, rwc io.ReadWriteCloser, dialer
 	netDialer = dialer
 	netRWC = targetRWC
 	netProxy = netstack.NewNetProxy(dialer)
+	netProxy.Through = true
 	netProxy.MTU, netProxy.Timeout = mtu, 15*time.Second
 	err := netProxy.Bootstrap(conf)
 	if err != nil {
@@ -92,21 +110,23 @@ func Bootstrap(conf string, mtu int, dump string, rwc io.ReadWriteCloser, dialer
 	return
 }
 
-//Start the process
-func Start() (res string) {
+//cs_start the process
+//export cs_start
+func cs_start() (res string) {
 	if netRunning {
 		res = "already started"
 		return
 	}
 	netRunning = true
 	core.InfoLog("NetProxy is starting")
-	netProxy.StartProcessReader(netRWC)
+	// netProxy.StartProcessReader(netRWC)
 	netProxy.StartProcessTimeout()
 	return
 }
 
-//Stop the process
-func Stop() (res string) {
+//stop the process
+//export cs_stop
+func cs_stop() (res string) {
 	netLocker.Lock()
 	defer netLocker.Unlock()
 	if !netRunning || netProxy == nil {
@@ -129,8 +149,9 @@ func Stop() (res string) {
 	return
 }
 
-//ProxySet will add proxy setting by key
-func ProxySet(key string, proxy bool) (res string) {
+//cs_proxy_set will add proxy setting by key
+//export cs_proxy_set
+func cs_proxy_set(key string, proxy bool) (res string) {
 	netLocker.RLock()
 	defer netLocker.RUnlock()
 	if netProxy == nil {
@@ -145,8 +166,9 @@ func ProxySet(key string, proxy bool) (res string) {
 	return
 }
 
-//ChangeMode will change proxy mode by global/auto
-func ChangeMode(mode string) (res string) {
+//cs_change_mode will change proxy mode by global/auto
+//export cs_change_mode
+func cs_change_mode(mode string) (res string) {
 	netLocker.RLock()
 	defer netLocker.RUnlock()
 	if netProxy == nil {
@@ -162,8 +184,9 @@ func ChangeMode(mode string) (res string) {
 	return
 }
 
-//ProxyMode will return current proxy mode
-func ProxyMode() (mode string) {
+//cs_proxy_mode will return current proxy mode
+//export cs_proxy_mode
+func cs_proxy_mode() (mode string) {
 	netLocker.RLock()
 	defer netLocker.RUnlock()
 	if netProxy == nil {
@@ -176,42 +199,49 @@ func ProxyMode() (mode string) {
 	return
 }
 
-//TestWeb will test web request
-func TestWeb(url, digest string) {
-	// fmt.Printf("testWeb start by url:%v,digest:%v\n", url, digest)
+//cs_test_web will test web request
+//export cs_test_web
+func cs_test_web(url, digest string) {
+	testWeb(url, digest, os.Stdout)
+}
+
+func testWeb(url, digest string, outer io.Writer) {
+	fmt.Fprintf(outer, "testWeb start by url:%v,digest:%v\n", url, digest)
 	// var raw net.Conn
-	// client := &http.Client{
-	// 	Transport: &http.Transport{
-	// 		Dial: func(network, addr string) (conn net.Conn, err error) {
-	// 			conn, err = net.Dial(network, addr)
-	// 			return
-	// 		},
-	// 	},
-	// }
-	// req, err := http.NewRequest("GET", url, nil)
-	// if err != nil {
-	// 	fmt.Printf("testWeb new fail with %v\n", err)
-	// 	return
-	// }
-	// res, err := client.Do(req)
-	// if err != nil {
-	// 	fmt.Printf("testWeb do fail with %v\n", err)
-	// 	return
-	// }
-	// defer res.Body.Close()
+	client := &http.Client{
+		Transport: &http.Transport{
+			Dial: func(network, addr string) (conn net.Conn, err error) {
+				conn, err = net.Dial(network, addr)
+				return
+			},
+		},
+	}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		fmt.Fprintf(outer, "testWeb new fail with %v\n", err)
+		return
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		fmt.Fprintf(outer, "testWeb do fail with %v\n", err)
+		return
+	}
+	defer res.Body.Close()
+	buf := bytes.NewBuffer(nil)
 	// h := sha1.New()
-	// _, err = io.Copy(h, res.Body)
+	_, err = io.Copy(buf, res.Body)
 	// if err != nil {
-	// 	fmt.Printf("testWeb copy fail with %v\n", err)
+	// 	fmt.Fprintf(outer, "testWeb copy fail with %v\n", err)
 	// 	return
 	// }
 	// v := fmt.Sprintf("%x", h.Sum(nil))
 	// if v != digest {
-	// 	fmt.Printf("testWeb done fail by digest not match %v,%v\n", v, digest)
+	// 	fmt.Fprintf(outer, "testWeb done fail by digest not match %v,%v\n", v, digest)
 	// } else {
-	// 	fmt.Printf("testWeb done success by %v\n", v)
+	// 	fmt.Fprintf(outer, "testWeb done success by %v\n", v)
 	// }
 	// if raw != nil {
 	// 	raw.Close()
 	// }
+	fmt.Fprintf(outer, "testWeb response\n%v\n", string(buf.Bytes()))
 }

@@ -397,12 +397,12 @@ func TestMessageDialer(t *testing.T) {
 	dialer2 := NewMessageDialer([]byte("m"), 1024)
 	dialer2.Message <- make([]byte, 10240)
 	_, err = dialer2.Read(make([]byte, 100))
-	if err == nil || !strings.HasPrefix(err.Error(), "buffer is too small") {
+	if err == nil || !strings.Contains(err.Error(), "buffer is too small") {
 		t.Error(err)
 		return
 	}
 	_, err = dialer2.Write(make([]byte, 1024))
-	if err == nil || err.Error() != "connection not exist" {
+	if err == nil || !strings.Contains(err.Error(), "connection not exist") {
 		t.Error(err)
 		return
 	}

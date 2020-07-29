@@ -15,3 +15,5 @@ netstack/netcsock/csocks.json
 *.jar
 netstack/*.pcap
 test/test
+*.framework
+*.a

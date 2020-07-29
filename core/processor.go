@@ -5,12 +5,73 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"reflect"
 	"sync"
 )
+
+//OnReceivedF is function for data received
+type OnReceivedF func(io.ReadWriteCloser, []byte) (err error)
+
+//OnClosedF is function for connection closed
+type OnClosedF func(io.ReadWriteCloser) (err error)
+
+//ThroughReadeCloser is interface for sync read function
+type ThroughReadeCloser interface {
+	Throughable() bool
+	OnReceived(f OnReceivedF) (err error)
+	OnClosed(f OnClosedF) (err error)
+}
 
 //Processor is interface for process connection
 type Processor interface {
 	ProcConn(raw io.ReadWriteCloser, target string) (err error)
+}
+
+type CallThroughRWC struct {
+	Receiver OnReceivedF
+	Closer   OnClosedF
+	Base     io.Writer
+}
+
+func NewCallThroughRC(base io.Writer) (rwc *CallThroughRWC) {
+	rwc = &CallThroughRWC{Base: base}
+	return
+}
+
+func (c *CallThroughRWC) Read(p []byte) (n int, err error) {
+	if c.Receiver != nil {
+		err = fmt.Errorf("reader is throughing")
+		return
+	}
+	err = fmt.Errorf("not supported")
+	return
+}
+
+func (c *CallThroughRWC) Write(p []byte) (n int, err error) {
+	n, err = c.Base.Write(p)
+	return
+}
+
+func (c *CallThroughRWC) Close() (err error) {
+	if c.Closer != nil {
+		err = c.Closer(c)
+	}
+	if closer, ok := c.Base.(io.Closer); ok {
+		closer.Close()
+	}
+	return
+}
+
+func (c *CallThroughRWC) Throughable() bool {
+	return true
+}
+func (c *CallThroughRWC) OnReceived(f OnReceivedF) (err error) {
+	c.Receiver = f
+	return
+}
+func (c *CallThroughRWC) OnClosed(f OnClosedF) (err error) {
+	c.Closer = f
+	return
 }
 
 //AyncProcessor is Processor impl, it will process connection by async
@@ -47,12 +108,14 @@ func (a *AyncProcessor) String() string {
 //ProcConnDialer is ProcConn impl by dialer
 type ProcConnDialer struct {
 	Dialer
+	Through bool
 }
 
 //NewProcConnDialer will return new ProcConnDialer
-func NewProcConnDialer(dialer Dialer) (proc *ProcConnDialer) {
+func NewProcConnDialer(through bool, dialer Dialer) (proc *ProcConnDialer) {
 	proc = &ProcConnDialer{
-		Dialer: dialer,
+		Through: through,
+		Dialer:  dialer,
 	}
 	return
 }
@@ -67,9 +130,55 @@ func copyClose(dst, src io.ReadWriteCloser, bufferSize int) {
 //ProcConn process connection by dial
 func (p *ProcConnDialer) ProcConn(raw io.ReadWriteCloser, target string) (err error) {
 	conn, err := p.Dial(target)
-	if err == nil {
-		go copyClose(raw, conn, 512*1024)
-		copyClose(conn, raw, 32*1024)
+	if err != nil {
+		return
+	}
+	var dstA, srcA, dstB, srcB io.ReadWriteCloser
+	if through, ok := conn.(ThroughReadeCloser); p.Through && ok && through.Throughable() {
+		InfoLog("%v is do throughable by %v,%v", conn, ok, ok && through.Throughable())
+		through.OnReceived(func(r io.ReadWriteCloser, p []byte) (err error) {
+			_, err = raw.Write(p)
+			if err != nil {
+				InfoLog("%v will close by send data to %v fail with %v", conn, raw, err)
+				conn.Close()
+			}
+			return
+		})
+		through.OnClosed(func(r io.ReadWriteCloser) (err error) {
+			err = raw.Close()
+			return
+		})
+	} else {
+		WarnLog("%v is not do throughable by %v,%v", reflect.TypeOf(conn), ok, ok && through.Throughable())
+		dstA, srcA = raw, conn
+	}
+	if through, ok := raw.(ThroughReadeCloser); p.Through && ok && through.Throughable() {
+		InfoLog("%v is do throughable by %v,%v", raw, ok, ok && through.Throughable())
+		through.OnReceived(func(r io.ReadWriteCloser, p []byte) (err error) {
+			_, err = conn.Write(p)
+			if err != nil {
+				InfoLog("%v will close by send data to %v fail with %v", raw, conn, err)
+				raw.Close()
+			}
+			return
+		})
+		through.OnClosed(func(r io.ReadWriteCloser) (err error) {
+			err = conn.Close()
+			return
+		})
+	} else {
+		WarnLog("%v is not do throughable by %v,%v", reflect.TypeOf(raw), ok, ok && through.Throughable())
+		if dstA != nil {
+			dstB, srcB = conn, raw
+		} else {
+			dstA, srcA = conn, raw
+		}
+	}
+	if dstB != nil {
+		go copyClose(dstB, srcB, 32*1024)
+	}
+	if dstA != nil {
+		copyClose(dstA, srcA, 32*1024)
 	}
 	return
 }
@@ -207,18 +316,25 @@ func (p *PACProcessor) String() string {
 
 //EchoProcessor is Processor impl for echo connection
 type EchoProcessor struct {
+	Through bool
 }
 
 //NewEchoProcessor will return new EchoProceessor
-func NewEchoProcessor() (echo *EchoProcessor) {
-	return &EchoProcessor{}
+func NewEchoProcessor(through bool) (echo *EchoProcessor) {
+	return &EchoProcessor{Through: through}
 }
 
 //ProcConn will process connection
-func (e *EchoProcessor) ProcConn(r io.ReadWriteCloser, target string) (err error) {
+func (e *EchoProcessor) ProcConn(raw io.ReadWriteCloser, target string) (err error) {
+	if through, ok := raw.(ThroughReadeCloser); e.Through && ok && through.Throughable() {
+		through.OnReceived(func(r io.ReadWriteCloser, p []byte) (err error) {
+			_, err = raw.Write(p)
+			return
+		})
+		return
+	}
 	InfoLog("EchoProceessor process connection %v", target)
-	_, err = io.Copy(r, r)
-	r.Close()
+	copyClose(raw, raw, 32*1024)
 	return
 }
 

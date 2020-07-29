@@ -220,6 +220,28 @@ func NewConnWrapper(base io.ReadWriteCloser) (wrapper *ConnWrapper) {
 	return &ConnWrapper{ReadWriteCloser: base}
 }
 
+//Throughable for impl ThroughReadeCloser
+func (c *ConnWrapper) Throughable() bool {
+	through, ok := c.ReadWriteCloser.(ThroughReadeCloser)
+	return ok && through.Throughable()
+}
+
+//OnReceived for impl ThroughReadeCloser
+func (c *ConnWrapper) OnReceived(f OnReceivedF) (err error) {
+	if through, ok := c.ReadWriteCloser.(ThroughReadeCloser); ok {
+		err = through.OnReceived(f)
+	}
+	return
+}
+
+//OnClosed for impl ThroughReadeCloser
+func (c *ConnWrapper) OnClosed(f OnClosedF) (err error) {
+	if through, ok := c.ReadWriteCloser.(ThroughReadeCloser); ok {
+		err = through.OnClosed(f)
+	}
+	return
+}
+
 //Network impl net.Addr
 func (c *ConnWrapper) Network() string {
 	return "wrapper"

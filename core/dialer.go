@@ -456,7 +456,9 @@ func (a *AsyncDialer) Dial(remote string) (raw io.ReadWriteCloser, err error) {
 
 //EchoConn is net.Conn impl by os.Pipe
 type EchoConn struct {
-	r, w *os.File
+	r, w     *os.File
+	receiver OnReceivedF
+	closer   OnClosedF
 }
 
 //NewEchoConn will return new echo connection
@@ -466,18 +468,47 @@ func NewEchoConn() (conn *EchoConn, err error) {
 	return
 }
 
+//Throughable for impl ThroughReadeCloser
+func (e *EchoConn) Throughable() bool {
+	return true
+}
+
+//OnReceived for impl ThroughReadeCloser
+func (e *EchoConn) OnReceived(f OnReceivedF) (err error) {
+	e.receiver = f
+	return
+}
+
+//OnClosed for impl ThroughReadeCloser
+func (e *EchoConn) OnClosed(f OnClosedF) (err error) {
+	e.closer = f
+	return
+}
+
 func (e *EchoConn) Read(b []byte) (n int, err error) {
+	if e.receiver != nil {
+		err = fmt.Errorf("reader is throughing")
+		return
+	}
 	n, err = e.r.Read(b)
 	return
 }
 
 func (e *EchoConn) Write(b []byte) (n int, err error) {
+	if e.receiver != nil {
+		e.receiver(e, b)
+		n = len(b)
+		return
+	}
 	n, err = e.w.Write(b)
 	return
 }
 
 // Close closes the connection.
 func (e *EchoConn) Close() error {
+	if e.closer != nil {
+		e.closer(e)
+	}
 	return e.r.Close()
 }
 
@@ -990,6 +1021,32 @@ func (p *PrintConn) Close() (err error) {
 	return
 }
 
+//Throughable is impl ThroughReadeCloser
+func (p *PrintConn) Throughable() bool {
+	through, ok := p.ReadWriteCloser.(ThroughReadeCloser)
+	return ok && through.Throughable()
+}
+
+//OnReceive is impl ThroughReadeCloser
+func (p *PrintConn) OnReceive(f OnReceivedF) (err error) {
+	if through, ok := p.ReadWriteCloser.(ThroughReadeCloser); ok && through.Throughable() {
+		err = through.OnReceived(f)
+	} else {
+		err = fmt.Errorf("not throughable")
+	}
+	return
+}
+
+//OnClosed is impl ThroughReadeCloser
+func (p *PrintConn) OnClosed(f OnClosedF) (err error) {
+	if through, ok := p.ReadWriteCloser.(ThroughReadeCloser); ok && through.Throughable() {
+		err = through.OnClosed(f)
+	} else {
+		err = fmt.Errorf("not throughable")
+	}
+	return
+}
+
 type PrintDialer struct {
 	Dialer
 }
@@ -1009,33 +1066,33 @@ func (m *PrintDialer) Dial(remote string) (raw io.ReadWriteCloser, err error) {
 	return
 }
 
-type CountConn struct {
-	io.ReadWriteCloser
-	read  *uint64
-	write *uint64
-}
+// type CountConn struct {
+// 	io.ReadWriteCloser
+// 	read  *uint64
+// 	write *uint64
+// }
 
-func NewCountConn(base io.ReadWriteCloser, read, write *uint64) (conn *CountConn) {
-	conn = &CountConn{
-		ReadWriteCloser: base,
-		read:            read,
-		write:           write,
-	}
-	return
-}
+// func NewCountConn(base io.ReadWriteCloser, read, write *uint64) (conn *CountConn) {
+// 	conn = &CountConn{
+// 		ReadWriteCloser: base,
+// 		read:            read,
+// 		write:           write,
+// 	}
+// 	return
+// }
 
-func (c *CountConn) Write(p []byte) (n int, err error) {
-	n, err = c.ReadWriteCloser.Write(p)
-	if err == nil {
-		atomic.AddUint64(c.write, uint64(n))
-	}
-	return
-}
+// func (c *CountConn) Write(p []byte) (n int, err error) {
+// 	n, err = c.ReadWriteCloser.Write(p)
+// 	if err == nil {
+// 		atomic.AddUint64(c.write, uint64(n))
+// 	}
+// 	return
+// }
 
-func (c *CountConn) Read(p []byte) (n int, err error) {
-	n, err = c.ReadWriteCloser.Read(p)
-	if err == nil {
-		atomic.AddUint64(c.read, uint64(n))
-	}
-	return
-}
+// func (c *CountConn) Read(p []byte) (n int, err error) {
+// 	n, err = c.ReadWriteCloser.Read(p)
+// 	if err == nil {
+// 		atomic.AddUint64(c.read, uint64(n))
+// 	}
+// 	return
+// }

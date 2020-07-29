@@ -6,7 +6,8 @@ import (
 	"net"
 	"time"
 
-	"github.com/google/netstack/tcpip/header"
+	"github.com/coversocks/gocs/core"
+	"github.com/coversocks/gocs/netstack/tcpip/header"
 )
 
 type ValueError struct {
@@ -39,6 +40,28 @@ func NewWrapRWC(base interface{}) (rwc *WrapRWC) {
 		Reader: base,
 		Writer: base,
 		Closer: base,
+	}
+	return
+}
+
+//Throughable for impl ThroughReadeCloser
+func (w *WrapRWC) Throughable() bool {
+	through, ok := w.Base.(core.ThroughReadeCloser)
+	return ok && through.Throughable()
+}
+
+//OnReceived for impl ThroughReadeCloser
+func (w *WrapRWC) OnReceived(f core.OnReceivedF) (err error) {
+	if through, ok := w.Base.(core.ThroughReadeCloser); ok {
+		err = through.OnReceived(f)
+	}
+	return
+}
+
+//OnClosed for impl ThroughReadeCloser
+func (w *WrapRWC) OnClosed(f core.OnClosedF) (err error) {
+	if through, ok := w.Base.(core.ThroughReadeCloser); ok {
+		err = through.OnClosed(f)
 	}
 	return
 }
@@ -128,6 +151,34 @@ func NewPrintRWC(enable bool, name string, base io.ReadWriteCloser) (rwc *PrintR
 	return
 }
 
+//Throughable for impl ThroughReadeCloser
+func (p *PrintRWC) Throughable() bool {
+	through, ok := p.Base.(core.ThroughReadeCloser)
+	return ok && through.Throughable()
+}
+
+//OnReceived for impl ThroughReadeCloser
+func (p *PrintRWC) OnReceived(f core.OnReceivedF) (err error) {
+	if through, ok := p.Base.(core.ThroughReadeCloser); ok {
+		err = through.OnReceived(func(r io.ReadWriteCloser, buf []byte) (err error) {
+			err = f(r, buf)
+			if p.Enable && err == nil {
+				fmt.Printf("%v read %v by %x\n", p.Name, len(buf), buf)
+			}
+			return
+		})
+	}
+	return
+}
+
+//OnClosed for impl ThroughReadeCloser
+func (p *PrintRWC) OnClosed(f core.OnClosedF) (err error) {
+	if through, ok := p.Base.(core.ThroughReadeCloser); ok {
+		err = through.OnClosed(f)
+	}
+	return
+}
+
 func (p *PrintRWC) Read(b []byte) (n int, err error) {
 	n, err = p.Base.Read(b)
 	if p.Enable && err == nil {
@@ -161,6 +212,28 @@ type PacketPrintRWC struct {
 
 func NewPacketPrintRWC(enable bool, name string, base io.ReadWriteCloser, eth bool) (rwc *PacketPrintRWC) {
 	rwc = &PacketPrintRWC{Enable: enable, Name: name, Eth: eth, ReadWriteCloser: base}
+	return
+}
+
+//Throughable for impl ThroughReadeCloser
+func (p *PacketPrintRWC) Throughable() bool {
+	through, ok := p.ReadWriteCloser.(core.ThroughReadeCloser)
+	return ok && through.Throughable()
+}
+
+//OnReceived for impl ThroughReadeCloser
+func (p *PacketPrintRWC) OnReceived(f core.OnReceivedF) (err error) {
+	if through, ok := p.ReadWriteCloser.(core.ThroughReadeCloser); ok {
+		err = through.OnReceived(f)
+	}
+	return
+}
+
+//OnClosed for impl ThroughReadeCloser
+func (p *PacketPrintRWC) OnClosed(f core.OnClosedF) (err error) {
+	if through, ok := p.ReadWriteCloser.(core.ThroughReadeCloser); ok {
+		err = through.OnClosed(f)
+	}
 	return
 }
 
@@ -199,7 +272,7 @@ func (p *PacketPrintRWC) print(sub string, b []byte) {
 			rst := packet.TCP.Flags() & header.TCPFlagRst
 			data := len(packet.TCP.Payload())
 			InfoLog(`
-%v.%v Packet
+%v.%v TCP Packet
 	src:%v:%v
 	dst:%v:%v
 	seq:%v
@@ -212,7 +285,24 @@ func (p *PacketPrintRWC) print(sub string, b []byte) {
 	data:%v
 `, p.Name, sub, srcAddr, srcPort, dstAddr, dstPort, seqNum, ackNum, syn, ack, psh, fin, rst, data)
 		}
+		if packet.Proto == header.UDPProtocolNumber {
+			srcAddr := packet.IPv4.SourceAddress()
+			dstAddr := packet.IPv4.DestinationAddress()
+			srcPort := packet.UDP.SourcePort()
+			dstPort := packet.UDP.DestinationPort()
+			data := len(packet.UDP.Payload())
+			InfoLog(`
+%v.%v UDP Packet
+	src:%v:%v
+	dst:%v:%v
+	data:%v
+`, p.Name, sub, srcAddr, srcPort, dstAddr, dstPort, data)
+		}
 	}
+}
+
+func (p *PacketPrintRWC) String() string {
+	return fmt.Sprintf("PacketPrintRWC(%v)", p.ReadWriteCloser)
 }
 
 type ChannelListener struct {
@@ -277,4 +367,8 @@ func (w *WaitReader) Close() (err error) {
 		err = closer.Close()
 	}
 	return
+}
+
+func (w *WaitReader) String() string {
+	return fmt.Sprintf("WaitReader(%v)", w.Base)
 }

@@ -9,7 +9,7 @@ import (
 	"sync"
 
 	"github.com/coversocks/gocs/core"
-	"github.com/miekg/dns"
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 const (
@@ -103,30 +103,59 @@ func (g *GFW) String() string {
 
 //Conn impl the  connection for read/write  message
 type Conn struct {
-	p          *Processor
-	key        string
-	base       io.ReadWriteCloser
-	readQueued chan []byte
-	closed     bool
-	reader     io.Reader
-	lck        sync.RWMutex
+	p            *Processor
+	key          string
+	base         io.ReadWriteCloser
+	receiverChan chan []byte
+	receiverFunc core.OnReceivedF
+	closerFunc   core.OnClosedF
+	closed       bool
+	reader       io.Reader
+	lck          sync.RWMutex
 }
 
 //NewConn will create new Conn
 func NewConn(p *Processor, key string, base io.ReadWriteCloser, bufferSize int) (conn *Conn) {
 	conn = &Conn{
-		p:          p,
-		key:        key,
-		base:       base,
-		readQueued: make(chan []byte, 1024),
-		lck:        sync.RWMutex{},
+		p:            p,
+		key:          key,
+		base:         base,
+		receiverChan: make(chan []byte, 1024),
+		lck:          sync.RWMutex{},
 	}
 	if bufferSize > 0 {
 		conn.reader = bufio.NewReaderSize(core.ReaderF(conn.rawRead), bufferSize)
 	} else {
-		conn.reader = base
+		conn.reader = core.ReaderF(conn.rawRead)
 	}
 	return
+}
+
+//Throughable is for impl core.ThroughReadeCloser
+func (c *Conn) Throughable() bool {
+	return true
+}
+
+//OnReceived is for impl core.ThroughReadeCloser
+func (c *Conn) OnReceived(f core.OnReceivedF) (err error) {
+	c.receiverFunc = f
+	return
+}
+
+//OnClosed is core.ThroughReadeCloser impl
+func (c *Conn) OnClosed(f core.OnClosedF) (err error) {
+	c.closerFunc = f
+	return
+}
+
+func (c *Conn) receiveData(data []byte) {
+	if c.receiverFunc == nil {
+		buf := make([]byte, len(data))
+		copy(buf, data)
+		c.receiverChan <- buf
+	} else {
+		c.receiverFunc(c, data)
+	}
 }
 
 func (c *Conn) Read(p []byte) (n int, err error) {
@@ -141,7 +170,7 @@ func (c *Conn) rawRead(p []byte) (n int, err error) {
 		return
 	}
 	c.lck.RUnlock()
-	data := <-c.readQueued
+	data := <-c.receiverChan
 	if data == nil {
 		err = fmt.Errorf("closed")
 		return
@@ -169,13 +198,18 @@ func (c *Conn) Write(p []byte) (n int, err error) {
 //Close will close the connection
 func (c *Conn) Close() (err error) {
 	c.lck.Lock()
-	defer c.lck.Unlock()
 	if c.closed {
 		err = fmt.Errorf("closed")
+		c.lck.Unlock()
 		return
 	}
 	c.closed = true
-	close(c.readQueued)
+	close(c.receiverChan)
+	c.receiverFunc = nil
+	c.lck.Unlock()
+	if c.closerFunc != nil {
+		c.closerFunc(c)
+	}
 	c.p.close(c)
 	return
 }
@@ -187,6 +221,7 @@ func (c *Conn) String() string {
 //Processor impl to core.Processor for process  connection
 type Processor struct {
 	Async      bool
+	Through    bool
 	bufferSize int
 	conns      map[string]*Conn
 	connsLck   sync.RWMutex
@@ -195,9 +230,10 @@ type Processor struct {
 }
 
 //NewProcessor will create new Processor
-func NewProcessor(async bool, bufferSize int, next core.Processor, target func(domain string) string) (p *Processor) {
+func NewProcessor(async, through bool, bufferSize int, next core.Processor, target func(domain string) string) (p *Processor) {
 	p = &Processor{
 		Async:      async,
+		Through:    through,
 		bufferSize: bufferSize,
 		conns:      map[string]*Conn{},
 		connsLck:   sync.RWMutex{},
@@ -209,12 +245,33 @@ func NewProcessor(async bool, bufferSize int, next core.Processor, target func(d
 
 //ProcConn will process connection
 func (p *Processor) ProcConn(r io.ReadWriteCloser, target string) (err error) {
-	core.DebugLog("Processor proc for %v", r)
-	if p.Async {
-		go p.proc(r)
-	} else {
-		p.proc(r)
+	if through, ok := r.(core.ThroughReadeCloser); p.Through && ok && through.Throughable() {
+		through.OnReceived(p.procData)
+		through.OnClosed(p.procClose)
+		return
 	}
+	if p.Async {
+		go p.proc(r, target)
+	} else {
+		err = p.proc(r, target)
+	}
+	return
+}
+
+func (p *Processor) proc(r io.ReadWriteCloser, target string) (err error) {
+	core.DebugLog("Processor dns runner is starting for %v", r)
+	var n int
+	buf := make([]byte, 32*1024)
+	for {
+		n, err = r.Read(buf)
+		if err != nil {
+			core.InfoLog("Processor(DNS) connection %v read fail with %v", r, err)
+			break
+		}
+		err = p.procData(r, buf[0:n])
+	}
+	p.procClose(r)
+	core.DebugLog("Processor dns runner is stopped for %v", r)
 	return
 }
 
@@ -224,42 +281,35 @@ func (p *Processor) close(c *Conn) {
 	p.connsLck.Unlock()
 }
 
-func (p *Processor) proc(r io.ReadWriteCloser) {
-	core.DebugLog("Processor dns runner is starting for %v", r)
-	var n int
-	var err error
-	for {
-		buf := make([]byte, 32*1024)
-		n, err = r.Read(buf)
-		if err != nil {
-			core.InfoLog("Processor(DNS) connection %v read fail with %v", r, err)
-			break
-		}
-		msg := new(dns.Msg)
-		err = msg.Unpack(buf[0:n])
-		if err != nil {
-			core.WarnLog("Processor(DNS) unpack dns package fail with %v by %v", err, buf[0:n])
-			continue
-		}
-		var target = p.Target(msg.Question[0].Name)
-		var key = fmt.Sprintf("%p-%v", r, target)
-		p.connsLck.Lock()
-		conn, ok := p.conns[key]
-		if !ok {
-			conn = NewConn(p, key, r, p.bufferSize)
-			p.conns[key] = conn
-		}
-		p.connsLck.Unlock()
-		if !ok {
-			err = p.Next.ProcConn(conn, target)
-			if err != nil {
-				//drop it
-				core.WarnLog("Processor dns runner proc %v fail with %v", r, err)
-				continue
-			}
-		}
-		conn.readQueued <- buf[0:n]
+func (p *Processor) procData(r io.ReadWriteCloser, data []byte) (err error) {
+	msg := new(dnsmessage.Message)
+	err = msg.Unpack(data)
+	if err != nil {
+		core.WarnLog("Processor(DNS) unpack dns package fail with %v by %v", err, data)
+		return
 	}
+	var target = p.Target(msg.Questions[0].Name.GoString())
+	var key = fmt.Sprintf("%p-%v", r, target)
+	p.connsLck.Lock()
+	conn, ok := p.conns[key]
+	if !ok {
+		conn = NewConn(p, key, r, p.bufferSize)
+		p.conns[key] = conn
+	}
+	p.connsLck.Unlock()
+	if !ok {
+		err = p.Next.ProcConn(conn, target)
+		if err != nil {
+			//drop it
+			core.WarnLog("Processor dns runner proc %v fail with %v", r, err)
+			return
+		}
+	}
+	conn.receiveData(data)
+	return
+}
+
+func (p *Processor) procClose(r io.ReadWriteCloser) (err error) {
 	r.Close()
 	prefix := fmt.Sprintf("%p-", r)
 	closing := []*Conn{}
@@ -272,10 +322,11 @@ func (p *Processor) proc(r io.ReadWriteCloser) {
 		}
 	}
 	p.connsLck.Unlock()
-	core.DebugLog("Processor dns runner is stopped for %v and close %v/%v connection", r, len(closing), allc)
+	core.DebugLog("Processor dns connection is closed for %v and close %v/%v connection", r, len(closing), allc)
 	for _, c := range closing {
 		c.Close()
 	}
+	return
 }
 
 //State will return the state
@@ -298,51 +349,53 @@ func (p *Processor) String() string {
 
 //RecordConn is  connection for recording  response
 type RecordConn struct {
-	p    *RecordProcessor
-	base io.ReadWriteCloser
+	io.ReadWriteCloser
+	p *RecordProcessor
 }
 
 //NewRecordConn will create new RecordConn
 func NewRecordConn(p *RecordProcessor, base io.ReadWriteCloser) (conn *RecordConn) {
 	conn = &RecordConn{
-		p:    p,
-		base: base,
+		p:               p,
+		ReadWriteCloser: base,
 	}
 	return
 }
 
 func (r *RecordConn) Read(p []byte) (n int, err error) {
-	n, err = r.base.Read(p)
+	n, err = r.ReadWriteCloser.Read(p)
 	return
 }
 
 func (r *RecordConn) Write(p []byte) (n int, err error) {
-	msg := new(dns.Msg)
+	msg := new(dnsmessage.Message)
 	xerr := msg.Unpack(p)
 	if xerr != nil {
 		core.WarnLog("Record unpack dns fail with %v by %v", xerr, p)
 	}
-	if xerr == nil && len(msg.Answer) > 0 {
-		for _, answer := range msg.Answer {
-			if a, ok := answer.(*dns.A); ok {
-				core.DebugLog("Record recoding %v->%v", a.Hdr.Name, a.A)
-				r.p.Record(a.A.String(), msg.Question[0].Name)
+	if xerr == nil && len(msg.Answers) > 0 {
+		for _, a := range msg.Answers {
+			if a.Header.Type == dnsmessage.TypeA {
+				key := a.Body.(*dnsmessage.AResource).GoString()
+				val := msg.Questions[0].Name.GoString()
+				core.DebugLog("Record recoding %v->%v", key, val)
+				r.p.Record(key, val)
 			}
 		}
 	}
-	n, err = r.base.Write(p)
+	n, err = r.ReadWriteCloser.Write(p)
 	return
 }
 
 //Close will close base connection
 func (r *RecordConn) Close() (err error) {
-	err = r.base.Close()
+	err = r.ReadWriteCloser.Close()
 	core.DebugLog("%v is closed", r)
 	return
 }
 
 func (r *RecordConn) String() string {
-	return fmt.Sprintf("RecordConn(%v)", r.base)
+	return fmt.Sprintf("RecordConn(%v)", r.ReadWriteCloser)
 }
 
 //RecordProcessor to impl processor for record  response

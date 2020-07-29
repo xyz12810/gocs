@@ -5,14 +5,12 @@ import (
 	"net"
 	"strings"
 
-	"github.com/google/netstack/tcpip"
-	"github.com/google/netstack/tcpip/buffer"
-	"github.com/google/netstack/tcpip/header"
+	"github.com/coversocks/gocs/netstack/tcpip/header"
 )
 
 type NotSupportedError struct {
 	Version  int
-	Protocol tcpip.TransportProtocolNumber
+	Protocol header.TransportProtocolNumber
 }
 
 func (n *NotSupportedError) Error() string {
@@ -23,7 +21,7 @@ type Packet struct {
 	Buffer  []byte
 	Eth     header.Ethernet
 	Version int
-	Proto   tcpip.TransportProtocolNumber
+	Proto   header.TransportProtocolNumber
 	IPv4    header.IPv4
 	IPv6    header.IPv6
 	ICMPv4  header.ICMPv4
@@ -62,7 +60,7 @@ func Swap(to *Packet, options, playload int) (pk *Packet, err error) {
 	return
 }
 
-func New(eth bool, version int, proto tcpip.TransportProtocolNumber, options, playload int) (pk *Packet, err error) {
+func New(eth bool, version int, proto header.TransportProtocolNumber, options, playload int) (pk *Packet, err error) {
 	length := 0
 	var ipOffset, protoOffset, playloadOffset int
 	if eth {
@@ -364,7 +362,7 @@ func (p *Packet) Verify() (err error) {
 				return fmt.Errorf("tcp checksum fail with expected 0x%x, but 0x%x", having, current)
 			}
 		case header.ICMPv4ProtocolNumber:
-			view := buffer.NewVectorisedView(1, []buffer.View{buffer.View(p.ICMPv4.Payload())})
+			view := header.NewVectorisedView(1, []header.View{header.View(p.ICMPv4.Payload())})
 			having := p.ICMPv4.Checksum()
 			p.ICMPv4.SetChecksum(0)
 			current := ^header.ICMPv4Checksum(p.ICMPv4, view)

@@ -28,11 +28,16 @@ type NetProcessor struct {
 }
 
 //NewNetProcessor will create new NetProcessor
-func NewNetProcessor(dnsAsync bool, bufferSize int, proxy, direct core.Processor) (net *NetProcessor) {
+func NewNetProcessor(through bool, bufferSize int, proxy, direct core.Processor) (net *NetProcessor) {
 	gfw := dns.NewGFW()
 	pac := core.NewPACProcessor(proxy, direct)
 	record := dns.NewRecordProcessor(pac)
-	dns := dns.NewProcessor(dnsAsync, bufferSize, core.NewAyncProcessor(record), gfw.Find)
+	async := !through
+	var dnsNext core.Processor = record
+	if async {
+		dnsNext = core.NewAyncProcessor(record)
+	}
+	dns := dns.NewProcessor(async, through, bufferSize, dnsNext, gfw.Find)
 	port := core.NewPortDistProcessor()
 	port.Add("53", dns)
 	port.Add("137", direct)
@@ -49,9 +54,8 @@ func (n *NetProcessor) pacCheck(key string) bool {
 	domain := n.Record.Value(key)
 	if len(domain) > 0 {
 		return n.GFW.IsProxy(domain)
-	} else {
-		return n.GFW.IsProxy(key)
 	}
+	return n.GFW.IsProxy(key)
 }
 
 //State will return the state info
@@ -67,6 +71,7 @@ func (n *NetProcessor) State() (state interface{}) {
 type NetProxy struct {
 	*tcpip.Stack
 	*NetProcessor
+	Through    bool
 	Eth        bool
 	MTU        int
 	Conf       string
@@ -129,12 +134,14 @@ func (n *NetProxy) Bootstrap(confFile string) (err error) {
 	//dns/pac processor init
 	rawDialer := core.NewRawDialerWrapper(n.Dialer)
 	// direct := core.NewAyncProcessor(core.NewProcConnDialer(rawDialer))
-	direct := core.NewProcConnDialer(rawDialer)
+	direct := core.NewProcConnDialer(n.Through, rawDialer)
 	// proxy := core.NewAyncProcessor(client)
-	net := NewNetProcessor(false, n.MTU*3, client, direct)
+	net := NewNetProcessor(n.Through, n.MTU*3, client, direct)
 	net.GFW.Set(strings.Join(rules, "\n"), "dns://proxy")
 	// net.GFW.Add("*", "dns://proxy")
-	proc := core.NewAyncProcessor(net)
+	// proc := core.NewAyncProcessor(net)
+	// proc := core.NewAyncProcessor(direct)
+	proc := direct
 	// proc := core.NewAyncProcessor(core.NewProcConnDialer(rawDialer))
 	//
 	//netstack init

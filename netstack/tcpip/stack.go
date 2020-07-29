@@ -5,10 +5,12 @@ import (
 	"io"
 	"math/rand"
 	"net"
+	"runtime"
 	"sync"
 	"time"
 
-	"github.com/google/netstack/tcpip/header"
+	"github.com/coversocks/gocs/core"
+	"github.com/coversocks/gocs/netstack/tcpip/header"
 )
 
 //DroppedError is netstack packet dropped error
@@ -66,15 +68,17 @@ var SequenceGenerater = rand.Int
 
 //Conn is net.Conn impl for udp connection
 type Conn struct {
-	*Packet     //accept packet
-	Key         string
-	err         error
-	latest      time.Time
-	status      int
-	stack       *Stack
-	receiver    chan []byte
-	closeLocker sync.RWMutex
-	mss         int
+	*Packet      //accept packet
+	Key          string
+	err          error
+	latest       time.Time
+	status       int
+	stack        *Stack
+	receiverChan chan []byte
+	receiverFunc core.OnReceivedF
+	closerFunc   core.OnClosedF
+	closeLocker  sync.RWMutex
+	mss          int
 
 	//tcp
 	acked  uint32
@@ -85,18 +89,53 @@ type Conn struct {
 //NewConn will create new Conn
 func NewConn(stack *Stack, key string, packet *Packet) (conn *Conn) {
 	conn = &Conn{
-		Key:         key,
-		receiver:    make(chan []byte, 10240),
-		closeLocker: sync.RWMutex{},
-		latest:      time.Now(),
-		stack:       stack,
-		Packet:      packet.Clone(),
-		mss:         stack.MTU - 100,
+		Key:          key,
+		receiverChan: make(chan []byte, 8),
+		closeLocker:  sync.RWMutex{},
+		latest:       time.Now(),
+		stack:        stack,
+		Packet:       packet.Clone(),
+		mss:          stack.MTU - 100,
 	}
 	return
 }
 
+//Throughable is core.ThroughReadeCloser impl
+func (c *Conn) Throughable() bool {
+	return true
+}
+
+//OnReceived is core.ThroughReadeCloser impl
+func (c *Conn) OnReceived(f core.OnReceivedF) (err error) {
+	c.receiverFunc = f
+	return
+}
+
+//OnClosed is core.ThroughReadeCloser impl
+func (c *Conn) OnClosed(f core.OnClosedF) (err error) {
+	c.closerFunc = f
+	return
+}
+
+func (c *Conn) receiveData(data []byte) {
+	if c.receiverFunc == nil {
+		buf := make([]byte, len(data))
+		copy(buf, data)
+		c.closeLocker.RLock()
+		if c.err == nil {
+			c.receiverChan <- buf
+		}
+		c.closeLocker.RUnlock()
+	} else {
+		c.receiverFunc(c, data)
+	}
+}
+
 func (c *Conn) Read(p []byte) (n int, err error) {
+	if c.receiverFunc != nil {
+		err = fmt.Errorf("Conn %v is running on async mode", c)
+		return
+	}
 	c.closeLocker.RLock()
 	if c.status > ConnStatusConnected {
 		err = fmt.Errorf(statusInfo(c.status))
@@ -105,7 +144,7 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 	}
 	c.closeLocker.RUnlock()
 	c.latest = time.Now()
-	data := <-c.receiver
+	data := <-c.receiverChan
 	if data == nil {
 		err = c.err
 		return
@@ -184,7 +223,10 @@ func (c *Conn) rawWrite(p []byte) (n int, err error) {
 
 //Close will close udp connection
 func (c *Conn) Close() (err error) {
-	DebugLog("Conn connection %v is closing by local", c)
+	buf := make([]byte, 32*1024)
+	blen := runtime.Stack(buf, false)
+	stack := string(buf[0:blen])
+	DebugLog("Conn connection %v is closing by local:\n%v\n", c, stack)
 	err = c.closeStart()
 	return
 }
@@ -216,8 +258,12 @@ func (c *Conn) closeFinised() {
 		c.err = fmt.Errorf("closed")
 	}
 	c.status = ConnStatusClosed
-	close(c.receiver)
+	close(c.receiverChan)
+	c.receiverFunc = nil
 	c.closeLocker.Unlock()
+	if c.closerFunc != nil {
+		c.closerFunc(c)
+	}
 	DebugLog("Conn connection %v close is finished", c)
 }
 
@@ -328,9 +374,7 @@ func (c *Conn) procReceive(received *Packet) (err error) {
 	if len(data) < 1 {
 		return
 	}
-	buf := make([]byte, len(data))
-	copy(buf, data)
-	c.receiver <- buf
+	c.receiveData(data)
 	c.procAck(received, uint32(len(data)))
 	return
 }
@@ -467,6 +511,7 @@ func (s *Stack) sendPacket(packet *Packet) (err error) {
 
 //ProcessReader will read input packet from reader and deliver frame to netstack
 func (s *Stack) ProcessReader(in io.Reader) (err error) {
+	s.waiter.Add(1)
 	InfoLog("Stack process reader(%v) is starting", in)
 	var n int
 	buffer := make([]byte, s.MTU)
@@ -492,7 +537,6 @@ func (s *Stack) StartProcessReader(in io.Reader) {
 	if s.running {
 		return
 	}
-	s.waiter.Add(1)
 	go s.ProcessReader(in)
 }
 
@@ -646,13 +690,7 @@ func (s *Stack) procUDP(packet *Packet, partialChecksum uint16) (err error) {
 		session.status = ConnStatusConnected
 		s.Handler.OnAccept(session)
 	}
-	session.closeLocker.RLock()
-	if session.err == nil {
-		buf := make([]byte, len(packet.Data))
-		copy(buf, packet.Data)
-		session.receiver <- buf
-	}
-	session.closeLocker.RUnlock()
+	session.receiveData(packet.Data)
 	return
 }
 
